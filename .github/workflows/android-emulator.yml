@@ -150,20 +150,29 @@ jobs:
             &
           sleep 2
 
-      - name: Create AVD if not cached
-        if: steps.avd-cache.outputs.cache-hit != 'true'
+      # FIX: "Unknown AVD name [prod_emulator]" error ဆိုတာ AVD ကို တကယ် create
+      # မလုပ်ရသေးခင် cache-hit=true ဖြစ်နေခြင်းကြောင့်ပါ — အရင် run တစ်ခုက fail
+      # သွားရင်တောင် empty/broken cache ကို key အောက်မှာ save ထားခဲ့နိုင်ပါတယ်။
+      # ဒါကြောင့် cache-hit output ကိုသာ မယုံပါနဲ့ — AVD config.ini ဖိုင်
+      # တကယ်ရှိ/မရှိ ကိုယ်တိုင် စစ်ပြီးမှ create လုပ်ပါတယ်။
+      - name: Create AVD if not exists
         run: |
-          echo "y" | sdkmanager \
-            "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
-            "platforms;android-${{ github.event.inputs.api_level }}" \
-            "platform-tools" \
-            "emulator"
+          if [ -f "$HOME/.android/avd/prod_emulator.avd/config.ini" ]; then
+            echo "AVD 'prod_emulator' already exists - skipping creation."
+          else
+            echo "AVD not found, creating a new one..."
+            echo "y" | sdkmanager \
+              "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
+              "platforms;android-${{ github.event.inputs.api_level }}" \
+              "platform-tools" \
+              "emulator"
 
-          avdmanager create avd \
-            -n "prod_emulator" \
-            -k "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
-            -d "${{ github.event.inputs.device_profile }}" \
-            --force
+            avdmanager create avd \
+              -n "prod_emulator" \
+              -k "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
+              -d "${{ github.event.inputs.device_profile }}" \
+              --force
+          fi
 
       - name: Configure emulator settings
         run: |
