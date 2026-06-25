@@ -57,6 +57,7 @@ jobs:
           echo "$ANDROID_HOME/emulator" >> $GITHUB_PATH
           echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
 
       - name: Cache AVD
         uses: actions/cache@v4
@@ -92,7 +93,7 @@ jobs:
           NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
           if [ -z "$NGROK_AUTH_TOKEN" ]; then
-            echo "::error::NGROK_AUTH_TOKEN secret ကို Settings > Secrets and variables > Actions မှာ ထည့်ပေးပါ (dashboard.ngrok.com ကနေ token ရယူနိုင်ပါတယ်)"
+            echo "::error::NGROK_AUTH_TOKEN secret is missing - add it in Settings > Secrets and variables > Actions"
             exit 1
           fi
 
@@ -140,10 +141,12 @@ jobs:
 
       - name: Create AVD if not exists
         run: |
-          if [ -f "$HOME/.android/avd/prod_emulator.ini" ]; then
+          mkdir -p "$ANDROID_AVD_HOME"
+          if [ -f "$ANDROID_AVD_HOME/prod_emulator.ini" ]; then
             echo "AVD 'prod_emulator' already exists - skipping creation."
           else
             echo "AVD not found (or previous attempt left it incomplete), creating now..."
+            echo "Using ANDROID_AVD_HOME=$ANDROID_AVD_HOME"
             yes | sdkmanager --licenses > /dev/null || true
 
             sdkmanager \
@@ -158,22 +161,26 @@ jobs:
               -d "${{ github.event.inputs.device_profile }}" \
               --force
             echo "avdmanager exit code: $?"
+            echo "--- avdmanager list avd ---"
+            avdmanager list avd
 
-            if [ ! -f "$HOME/.android/avd/prod_emulator.ini" ]; then
-              echo "::error::avdmanager ran but prod_emulator.ini ဖန်တီးမရပါ — အောက်က directory listing ကို စစ်ပါ"
-              echo "--- contents of \$HOME/.android/avd ---"
-              ls -la "$HOME/.android/avd" 2>&1 || echo "(directory does not exist)"
+            if [ ! -f "$ANDROID_AVD_HOME/prod_emulator.ini" ]; then
+              echo "::error::avdmanager ran but prod_emulator.ini was not created - see listing below"
+              echo "--- contents of \$ANDROID_AVD_HOME ($ANDROID_AVD_HOME) ---"
+              ls -la "$ANDROID_AVD_HOME" 2>&1 || echo "(directory does not exist)"
+              echo "--- searching whole filesystem for prod_emulator.ini ---"
+              find / -name "prod_emulator.ini" 2>/dev/null
               exit 1
             fi
           fi
 
       - name: Configure emulator settings
         run: |
-          mkdir -p ~/.android/avd/prod_emulator.avd
-          if grep -q "^hw.gpu.enabled=" ~/.android/avd/prod_emulator.avd/config.ini 2>/dev/null; then
+          mkdir -p "$ANDROID_AVD_HOME/prod_emulator.avd"
+          if grep -q "^hw.gpu.enabled=" "$ANDROID_AVD_HOME/prod_emulator.avd/config.ini" 2>/dev/null; then
             echo "Custom emulator settings already present - skipping."
           else
-            cat >> ~/.android/avd/prod_emulator.avd/config.ini << EOF
+            cat >> "$ANDROID_AVD_HOME/prod_emulator.avd/config.ini" << EOF
           hw.gpu.enabled=yes
           hw.gpu.mode=swiftshader_indirect
           hw.ramSize=2048
@@ -197,13 +204,13 @@ jobs:
           sleep 5
 
           if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-            echo "::error::emulator process immediately exited/crashed. 'emulator' command ရှိ/မရှိ PATH ကို စစ်ပါ (which emulator)။"
+            echo "::error::emulator process immediately exited/crashed. Check PATH (which emulator)."
             exit 1
           fi
 
           echo "Waiting for emulator to boot..."
           if ! timeout 60 adb wait-for-device; then
-            echo "::error::adb က 60 စက္ကန့်အတွင်း device ကို detect မရပါ။ emulator process crash ဖြစ်နေနိုင်ပါတယ်။"
+            echo "::error::adb did not detect a device within 60s. Emulator may have crashed."
             exit 1
           fi
 
