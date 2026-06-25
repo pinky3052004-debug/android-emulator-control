@@ -52,6 +52,17 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      # FIX: "emulator: command not found" error ဆိုတာ android-actions/setup-android
+      # action က $ANDROID_HOME/emulator folder ကို PATH ထဲ default အနေနဲ့ မထည့်ပေးတဲ့အတွက်
+      # ဖြစ်ပါတယ်။ ($ANDROID_HOME ရော platform-tools ရော SDK setup က PATH ထဲ ထည့်ပေးပေမယ့်
+      # emulator binary ရှိတဲ့ "emulator/" folder ကိုတော့ ထည့်မပေးပါ)။
+      # အောက်က step နဲ့ ၃ ဖိုလ်ဒါစလုံးကို PATH ထဲ ရှင်းရှင်းလင်းလင်း ထည့်ပေးလိုက်ပါတယ်။
+      - name: Add Android SDK tools to PATH
+        run: |
+          echo "$ANDROID_HOME/emulator" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
+
       - name: Cache AVD
         uses: actions/cache@v4
         id: avd-cache
@@ -84,11 +95,22 @@ jobs:
           cd backend
           npm install --omit=dev
 
+      # FIX: "accepts 1 arg(s), received 0" error ဆိုတာ ngrok ရဲ့ add-authtoken
+      # command ကို argument (token) ပါမပါပေးခဲ့ခြင်း ဖြစ်ပါတယ်။ secrets.NGROK_AUTH_TOKEN
+      # ကို repo မှာ မထည့်ထားသေးရင် empty string ဖြစ်နေပြီး ဒီ error တက်ပါတယ်။
+      # အောက်က step မှာ token မရှိရင် ရှင်းရှင်းလင်းလင်း error message ပြပြီး early-fail လုပ်ပေးထားပါတယ်။
       - name: Install ngrok
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         run: |
+          if [ -z "$NGROK_AUTH_TOKEN" ]; then
+            echo "::error::NGROK_AUTH_TOKEN secret ကို Settings > Secrets and variables > Actions မှာ ထည့်ပေးပါ (dashboard.ngrok.com ကနေ token ရယူနိုင်ပါတယ်)"
+            exit 1
+          fi
+
           curl -sL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar xz
           sudo mv ngrok /usr/local/bin/ngrok
-          ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+          ngrok config add-authtoken "$NGROK_AUTH_TOKEN"
 
       - name: Install noVNC
         run: |
@@ -165,9 +187,22 @@ jobs:
             -memory 2048 \
             -cores 2 \
             &
+          EMULATOR_PID=$!
+          sleep 5
+
+          # FIX: emulator process အစအချာက fail သွားရင် (e.g. command not found,
+          # crash) adb wait-for-device ကို ထာဝရစောင့်နေတော့မယ့်အစား ဒီနေရာမှာတင်
+          # ရှင်းရှင်းလင်းလင်း error ပြပြီး တန်းရပ်ပေးပါတယ်။
+          if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+            echo "::error::emulator process immediately exited/crashed. 'emulator' command ရှိ/မရှိ PATH ကို စစ်ပါ (which emulator)။"
+            exit 1
+          fi
 
           echo "Waiting for emulator to boot..."
-          adb wait-for-device
+          if ! timeout 60 adb wait-for-device; then
+            echo "::error::adb က 60 စက္ကန့်အတွင်း device ကို detect မရပါ။ emulator process crash ဖြစ်နေနိုင်ပါတယ်။"
+            exit 1
+          fi
 
           timeout 300 bash -c '
             until adb shell getprop sys.boot_completed 2>/dev/null | grep -q "1"; do
