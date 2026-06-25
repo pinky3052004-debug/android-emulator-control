@@ -1,0 +1,246 @@
+name: Android Emulator Web Control
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_level:
+        description: 'Android API Level'
+        required: true
+        default: '33'
+        type: choice
+        options: ['30', '31', '32', '33', '34']
+      device_profile:
+        description: 'Device Profile'
+        required: true
+        default: 'pixel_6'
+        type: choice
+        options: ['pixel_4', 'pixel_6', 'pixel_7', 'Nexus 5X']
+      session_duration:
+        description: 'Session duration (minutes)'
+        required: true
+        default: '30'
+        type: string
+
+env:
+  NGROK_VERSION: '3.6.0'
+  NOVNC_PORT: 6080
+  VNC_PORT: 5900
+  ADB_PORT: 5037
+  BACKEND_PORT: 3001
+
+jobs:
+  run-emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache AVD
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-api${{ github.event.inputs.api_level }}-${{ github.event.inputs.device_profile }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            x11vnc xvfb \
+            xfce4 xfce4-terminal \
+            git curl wget unzip \
+            python3 python3-pip \
+            net-tools netcat-openbsd
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install backend dependencies
+        run: |
+          cd backend
+          npm ci --production
+
+      - name: Install ngrok
+        run: |
+          curl -sL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar xz
+          sudo mv ngrok /usr/local/bin/ngrok
+          ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+
+      - name: Install noVNC
+        run: |
+          git clone --depth=1 https://github.com/novnc/noVNC.git /opt/noVNC
+          git clone --depth=1 https://github.com/novnc/websockify /opt/noVNC/utils/websockify
+
+      - name: Create and start virtual display
+        run: |
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          sleep 2
+
+      - name: Start XFCE desktop
+        run: |
+          DISPLAY=:99 startxfce4 &
+          sleep 3
+
+      - name: Start VNC server
+        run: |
+          x11vnc \
+            -display :99 \
+            -forever \
+            -nopw \
+            -shared \
+            -bg \
+            -rfbport ${{ env.VNC_PORT }} \
+            -o /tmp/x11vnc.log
+          sleep 2
+
+      - name: Start noVNC web server
+        run: |
+          /opt/noVNC/utils/novnc_proxy \
+            --vnc localhost:${{ env.VNC_PORT }} \
+            --listen ${{ env.NOVNC_PORT }} \
+            --web /opt/noVNC \
+            &
+          sleep 2
+
+      - name: Create AVD if not cached
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        run: |
+          echo "y" | sdkmanager \
+            "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
+            "platforms;android-${{ github.event.inputs.api_level }}" \
+            "platform-tools" \
+            "emulator"
+
+          avdmanager create avd \
+            -n "prod_emulator" \
+            -k "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
+            -d "${{ github.event.inputs.device_profile }}" \
+            --force
+
+      - name: Configure emulator settings
+        run: |
+          mkdir -p ~/.android/avd/prod_emulator.avd
+          cat >> ~/.android/avd/prod_emulator.avd/config.ini << EOF
+          hw.gpu.enabled=yes
+          hw.gpu.mode=swiftshader_indirect
+          hw.ramSize=2048
+          disk.dataPartition.size=4096M
+          hw.keyboard=yes
+          hw.mainKeys=no
+          EOF
+
+      - name: Start Android emulator
+        run: |
+          DISPLAY=:99 emulator \
+            -avd prod_emulator \
+            -gpu swiftshader_indirect \
+            -no-audio \
+            -no-snapshot-save \
+            -memory 2048 \
+            -cores 2 \
+            &
+
+          echo "Waiting for emulator to boot..."
+          adb wait-for-device
+
+          timeout 300 bash -c '
+            until adb shell getprop sys.boot_completed 2>/dev/null | grep -q "1"; do
+              echo "Waiting for boot..."
+              sleep 5
+            done
+          '
+          echo "Emulator booted successfully!"
+
+      - name: Start backend API server
+        run: |
+          cd backend
+          NODE_ENV=production \
+          ADB_PATH=$(which adb) \
+          SESSION_DURATION=${{ github.event.inputs.session_duration }} \
+          PORT=${{ env.BACKEND_PORT }} \
+          node server.js &
+          sleep 2
+
+      - name: Start ngrok tunnels
+        run: |
+          ngrok http ${{ env.NOVNC_PORT }} \
+            --log=stdout --log-format=json \
+            > /tmp/ngrok-novnc.log 2>&1 &
+
+          ngrok http ${{ env.BACKEND_PORT }} \
+            --log=stdout --log-format=json \
+            > /tmp/ngrok-api.log 2>&1 &
+
+          sleep 5
+
+      - name: Get and display tunnel URLs
+        run: |
+          TUNNELS=$(curl -s http://localhost:4040/api/tunnels)
+
+          NOVNC_URL=$(echo $TUNNELS | python3 -c "
+          import sys, json
+          t = json.load(sys.stdin)['tunnels']
+          for tunnel in t:
+              if '${{ env.NOVNC_PORT }}' in tunnel.get('config', {}).get('addr', ''):
+                  print(tunnel['public_url'])
+                  break
+          " 2>/dev/null || echo "")
+
+          API_URL=$(echo $TUNNELS | python3 -c "
+          import sys, json
+          t = json.load(sys.stdin)['tunnels']
+          for tunnel in t:
+              if '${{ env.BACKEND_PORT }}' in tunnel.get('config', {}).get('addr', ''):
+                  print(tunnel['public_url'])
+                  break
+          " 2>/dev/null || echo "")
+
+          echo ""
+          echo "========================================"
+          echo "   ANDROID EMULATOR SESSION READY!"
+          echo "========================================"
+          echo "  Web UI (noVNC):  $NOVNC_URL/vnc.html"
+          echo "  Backend API:     $API_URL"
+          echo "========================================"
+
+      - name: Keep session alive
+        run: |
+          DURATION_SECS=$(( ${{ github.event.inputs.session_duration }} * 60 ))
+          END_TIME=$(($(date +%s) + DURATION_SECS))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            REMAINING=$(( END_TIME - $(date +%s) ))
+            echo "Remaining: ${REMAINING}s | Boot: $(adb shell getprop sys.boot_completed 2>/dev/null)"
+            sleep 30
+          done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f emulator || true
+          pkill -f ngrok || true
+          pkill -f novnc_proxy || true
+          pkill -f x11vnc || true
+          pkill -f Xvfb || true
