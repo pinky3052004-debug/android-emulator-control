@@ -155,13 +155,22 @@ jobs:
       # သွားရင်တောင် empty/broken cache ကို key အောက်မှာ save ထားခဲ့နိုင်ပါတယ်။
       # ဒါကြောင့် cache-hit output ကိုသာ မယုံပါနဲ့ — AVD config.ini ဖိုင်
       # တကယ်ရှိ/မရှိ ကိုယ်တိုင် စစ်ပြီးမှ create လုပ်ပါတယ်။
+      # FIX (round 2): error message ထဲမှာတင် ပြောထားတာက "no file prod_emulator.ini
+      # in $HOME/.android/avd" ပါ — ဒါက avdmanager ကိုယ်တိုင် create လုပ်ပေးတဲ့
+      # POINTER ini file ဖြစ်ပြီး, .avd folder ထဲက config.ini နဲ့ မတူပါ။ ယခင် fix မှာ
+      # config.ini ကိုစစ်ခဲ့တာကြောင့် - "Configure emulator settings" step က
+      # mkdir -p + config.ini ကို အမြဲတမ်း create ပေးနေတာကို "AVD ရှိပြီ" လို့ မှားယွင်း
+      # နားလည်ခဲ့ပါတယ် (ဒါပေမယ့် avdmanager ကအမှန်တကယ် run ဖြစ်ခဲ့ဖို့ မလိုအပ်ပါ)။
+      # ဒါကြောင့် pointer ini file ကိုသာ စစ်ပါမယ် — ၎င်းမရှိရင် --force ဖြင့် ပြန် create လုပ်ပေးပါမယ်။
       - name: Create AVD if not exists
         run: |
-          if [ -f "$HOME/.android/avd/prod_emulator.avd/config.ini" ]; then
+          if [ -f "$HOME/.android/avd/prod_emulator.ini" ]; then
             echo "AVD 'prod_emulator' already exists - skipping creation."
           else
-            echo "AVD not found, creating a new one..."
-            echo "y" | sdkmanager \
+            echo "AVD not found (or previous attempt left it incomplete), creating now..."
+            yes | sdkmanager --licenses > /dev/null || true
+
+            sdkmanager \
               "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
               "platforms;android-${{ github.event.inputs.api_level }}" \
               "platform-tools" \
@@ -172,12 +181,20 @@ jobs:
               -k "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
               -d "${{ github.event.inputs.device_profile }}" \
               --force
+
+            if [ ! -f "$HOME/.android/avd/prod_emulator.ini" ]; then
+              echo "::error::avdmanager ran but prod_emulator.ini ဖန်တီးမရပါ — licenses သို့ system image install log ကို အပေါ်က step မှာ ပြန်စစ်ပါ။"
+              exit 1
+            fi
           fi
 
       - name: Configure emulator settings
         run: |
           mkdir -p ~/.android/avd/prod_emulator.avd
-          cat >> ~/.android/avd/prod_emulator.avd/config.ini << EOF
+          if grep -q "^hw.gpu.enabled=" ~/.android/avd/prod_emulator.avd/config.ini 2>/dev/null; then
+            echo "Custom emulator settings already present - skipping."
+          else
+            cat >> ~/.android/avd/prod_emulator.avd/config.ini << EOF
           hw.gpu.enabled=yes
           hw.gpu.mode=swiftshader_indirect
           hw.ramSize=2048
@@ -185,6 +202,7 @@ jobs:
           hw.keyboard=yes
           hw.mainKeys=no
           EOF
+          fi
 
       - name: Start Android emulator
         run: |
