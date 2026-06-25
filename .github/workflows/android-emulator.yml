@@ -52,11 +52,6 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      # FIX: "emulator: command not found" error ဆိုတာ android-actions/setup-android
-      # action က $ANDROID_HOME/emulator folder ကို PATH ထဲ default အနေနဲ့ မထည့်ပေးတဲ့အတွက်
-      # ဖြစ်ပါတယ်။ ($ANDROID_HOME ရော platform-tools ရော SDK setup က PATH ထဲ ထည့်ပေးပေမယ့်
-      # emulator binary ရှိတဲ့ "emulator/" folder ကိုတော့ ထည့်မပေးပါ)။
-      # အောက်က step နဲ့ ၃ ဖိုလ်ဒါစလုံးကို PATH ထဲ ရှင်းရှင်းလင်းလင်း ထည့်ပေးလိုက်ပါတယ်။
       - name: Add Android SDK tools to PATH
         run: |
           echo "$ANDROID_HOME/emulator" >> $GITHUB_PATH
@@ -87,18 +82,11 @@ jobs:
         with:
           node-version: '20'
 
-      # FIX: backend folder ထဲတွင် package-lock.json မရှိသောကြောင့် "npm ci" run လို့ မရပါ။
-      # "npm install" သုံးလိုက်တာဖြင့် lock file မရှိလည်း dependency တွေ install လုပ်နိုင်ပြီး
-      # "--production" deprecated warning ကိုလည်း "--omit=dev" ဖြင့် အစားထိုးထားပါတယ်။
       - name: Install backend dependencies
         run: |
           cd backend
           npm install --omit=dev
 
-      # FIX: "accepts 1 arg(s), received 0" error ဆိုတာ ngrok ရဲ့ add-authtoken
-      # command ကို argument (token) ပါမပါပေးခဲ့ခြင်း ဖြစ်ပါတယ်။ secrets.NGROK_AUTH_TOKEN
-      # ကို repo မှာ မထည့်ထားသေးရင် empty string ဖြစ်နေပြီး ဒီ error တက်ပါတယ်။
-      # အောက်က step မှာ token မရှိရင် ရှင်းရှင်းလင်းလင်း error message ပြပြီး early-fail လုပ်ပေးထားပါတယ်။
       - name: Install ngrok
         env:
           NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
@@ -150,18 +138,6 @@ jobs:
             &
           sleep 2
 
-      # FIX: "Unknown AVD name [prod_emulator]" error ဆိုတာ AVD ကို တကယ် create
-      # မလုပ်ရသေးခင် cache-hit=true ဖြစ်နေခြင်းကြောင့်ပါ — အရင် run တစ်ခုက fail
-      # သွားရင်တောင် empty/broken cache ကို key အောက်မှာ save ထားခဲ့နိုင်ပါတယ်။
-      # ဒါကြောင့် cache-hit output ကိုသာ မယုံပါနဲ့ — AVD config.ini ဖိုင်
-      # တကယ်ရှိ/မရှိ ကိုယ်တိုင် စစ်ပြီးမှ create လုပ်ပါတယ်။
-      # FIX (round 2): error message ထဲမှာတင် ပြောထားတာက "no file prod_emulator.ini
-      # in $HOME/.android/avd" ပါ — ဒါက avdmanager ကိုယ်တိုင် create လုပ်ပေးတဲ့
-      # POINTER ini file ဖြစ်ပြီး, .avd folder ထဲက config.ini နဲ့ မတူပါ။ ယခင် fix မှာ
-      # config.ini ကိုစစ်ခဲ့တာကြောင့် - "Configure emulator settings" step က
-      # mkdir -p + config.ini ကို အမြဲတမ်း create ပေးနေတာကို "AVD ရှိပြီ" လို့ မှားယွင်း
-      # နားလည်ခဲ့ပါတယ် (ဒါပေမယ့် avdmanager ကအမှန်တကယ် run ဖြစ်ခဲ့ဖို့ မလိုအပ်ပါ)။
-      # ဒါကြောင့် pointer ini file ကိုသာ စစ်ပါမယ် — ၎င်းမရှိရင် --force ဖြင့် ပြန် create လုပ်ပေးပါမယ်။
       - name: Create AVD if not exists
         run: |
           if [ -f "$HOME/.android/avd/prod_emulator.ini" ]; then
@@ -176,14 +152,17 @@ jobs:
               "platform-tools" \
               "emulator"
 
-            avdmanager create avd \
+            echo "no" | avdmanager create avd \
               -n "prod_emulator" \
               -k "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
               -d "${{ github.event.inputs.device_profile }}" \
               --force
+            echo "avdmanager exit code: $?"
 
             if [ ! -f "$HOME/.android/avd/prod_emulator.ini" ]; then
-              echo "::error::avdmanager ran but prod_emulator.ini ဖန်တီးမရပါ — licenses သို့ system image install log ကို အပေါ်က step မှာ ပြန်စစ်ပါ။"
+              echo "::error::avdmanager ran but prod_emulator.ini ဖန်တီးမရပါ — အောက်က directory listing ကို စစ်ပါ"
+              echo "--- contents of \$HOME/.android/avd ---"
+              ls -la "$HOME/.android/avd" 2>&1 || echo "(directory does not exist)"
               exit 1
             fi
           fi
@@ -217,9 +196,6 @@ jobs:
           EMULATOR_PID=$!
           sleep 5
 
-          # FIX: emulator process အစအချာက fail သွားရင် (e.g. command not found,
-          # crash) adb wait-for-device ကို ထာဝရစောင့်နေတော့မယ့်အစား ဒီနေရာမှာတင်
-          # ရှင်းရှင်းလင်းလင်း error ပြပြီး တန်းရပ်ပေးပါတယ်။
           if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
             echo "::error::emulator process immediately exited/crashed. 'emulator' command ရှိ/မရှိ PATH ကို စစ်ပါ (which emulator)။"
             exit 1
