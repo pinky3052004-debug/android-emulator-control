@@ -76,10 +76,13 @@ jobs:
         with:
           node-version: '20'
 
+      # FIX: backend folder ထဲတွင် package-lock.json မရှိသောကြောင့် "npm ci" run လို့ မရပါ။
+      # "npm install" သုံးလိုက်တာဖြင့် lock file မရှိလည်း dependency တွေ install လုပ်နိုင်ပြီး
+      # "--production" deprecated warning ကိုလည်း "--omit=dev" ဖြင့် အစားထိုးထားပါတယ်။
       - name: Install backend dependencies
         run: |
           cd backend
-          npm ci --production
+          npm install --omit=dev
 
       - name: Install ngrok
         run: |
