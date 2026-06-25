@@ -31,7 +31,7 @@ env:
 jobs:
   run-emulator:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -59,14 +59,19 @@ jobs:
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
 
-      - name: Cache AVD
+      # Cache key bumped to "-v2" and system-images/platforms added to the
+      # cached paths. This makes restored caches actually contain the SDK
+      # binaries, not just the AVD config files.
+      - name: Cache AVD & SDK packages
         uses: actions/cache@v4
         id: avd-cache
         with:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-api${{ github.event.inputs.api_level }}-${{ github.event.inputs.device_profile }}
+            ${{ env.ANDROID_HOME }}/system-images
+            ${{ env.ANDROID_HOME }}/platforms
+          key: avd-api${{ github.event.inputs.api_level }}-${{ github.event.inputs.device_profile }}-v2
 
       - name: Install system dependencies
         run: |
@@ -104,7 +109,7 @@ jobs:
       - name: Install noVNC
         run: |
           git clone --depth=1 https://github.com/novnc/noVNC.git /opt/noVNC
-          git clone --depth=1 https://github.com/novnc/websockify /opt/noVNC/utils/websockify
+          git clone --depth=1 https://github.com/novnc/websockify.git /opt/noVNC/utils/websockify
 
       - name: Create and start virtual display
         run: |
@@ -139,22 +144,37 @@ jobs:
             &
           sleep 2
 
+      # ============================================================
+      # FIX #1 — "FATAL | Broken AVD system path"
+      # ------------------------------------------------------------
+      # The original workflow only ran sdkmanager to install the
+      # system image INSIDE the "AVD doesn't exist yet" branch. On a
+      # cache-hit run, prod_emulator.ini gets restored from cache, so
+      # that whole branch (including the sdkmanager install) was
+      # skipped — but the actual system-image binaries were never
+      # guaranteed to be present. Result: the AVD pointed at a system
+      # image folder that didn't exist -> emulator crashed instantly.
+      #
+      # sdkmanager is idempotent (it skips anything already
+      # installed), so we now always run it, on every single run,
+      # regardless of whether the AVD itself is cached.
+      # ============================================================
+      - name: Install required SDK packages (always, idempotent)
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager \
+            "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
+            "platforms;android-${{ github.event.inputs.api_level }}" \
+            "platform-tools" \
+            "emulator"
+
       - name: Create AVD if not exists
         run: |
           mkdir -p "$ANDROID_AVD_HOME"
           if [ -f "$ANDROID_AVD_HOME/prod_emulator.ini" ]; then
             echo "AVD 'prod_emulator' already exists - skipping creation."
           else
-            echo "AVD not found (or previous attempt left it incomplete), creating now..."
-            echo "Using ANDROID_AVD_HOME=$ANDROID_AVD_HOME"
-            yes | sdkmanager --licenses > /dev/null || true
-
-            sdkmanager \
-              "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
-              "platforms;android-${{ github.event.inputs.api_level }}" \
-              "platform-tools" \
-              "emulator"
-
+            echo "AVD not found, creating now..."
             echo "no" | avdmanager create avd \
               -n "prod_emulator" \
               -k "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" \
@@ -166,9 +186,7 @@ jobs:
 
             if [ ! -f "$ANDROID_AVD_HOME/prod_emulator.ini" ]; then
               echo "::error::avdmanager ran but prod_emulator.ini was not created - see listing below"
-              echo "--- contents of \$ANDROID_AVD_HOME ($ANDROID_AVD_HOME) ---"
               ls -la "$ANDROID_AVD_HOME" 2>&1 || echo "(directory does not exist)"
-              echo "--- searching whole filesystem for prod_emulator.ini ---"
               find / -name "prod_emulator.ini" 2>/dev/null
               exit 1
             fi
@@ -232,41 +250,93 @@ jobs:
           node server.js &
           sleep 2
 
+      # ============================================================
+      # FIX #2 — noVNC URL printed as "/vnc.html" with no domain
+      # ------------------------------------------------------------
+      # The original workflow launched TWO separate `ngrok http`
+      # processes. Every ngrok agent process binds its local
+      # inspection API to 127.0.0.1:4040 by default. The SECOND
+      # process can't bind that same port, so only ONE of the two
+      # tunnels ever showed up in `curl localhost:4040/api/tunnels` —
+      # which is exactly why one URL (the backend) printed fine and
+      # the other (noVNC) came back empty.
+      #
+      # Fix: define BOTH tunnels in a single ngrok config file and
+      # start them with ONE agent process (`ngrok start --all`).
+      # Both tunnels then show up together under the same :4040 API.
+      # ============================================================
+      - name: Configure ngrok tunnels (single agent session)
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          mkdir -p ~/.config/ngrok
+          cat > ~/.config/ngrok/ngrok.yml << EOF
+          version: "3"
+          agent:
+            authtoken: ${NGROK_AUTH_TOKEN}
+          tunnels:
+            novnc:
+              proto: http
+              addr: ${{ env.NOVNC_PORT }}
+            backend:
+              proto: http
+              addr: ${{ env.BACKEND_PORT }}
+          EOF
+
       - name: Start ngrok tunnels
         run: |
-          ngrok http ${{ env.NOVNC_PORT }} \
+          ngrok start --all \
+            --config ~/.config/ngrok/ngrok.yml \
             --log=stdout --log-format=json \
-            > /tmp/ngrok-novnc.log 2>&1 &
+            > /tmp/ngrok.log 2>&1 &
+          sleep 6
 
-          ngrok http ${{ env.BACKEND_PORT }} \
-            --log=stdout --log-format=json \
-            > /tmp/ngrok-api.log 2>&1 &
-
-          sleep 5
+          if ! curl -s http://localhost:4040/api/tunnels > /dev/null; then
+            echo "::error::ngrok did not start - dumping log"
+            cat /tmp/ngrok.log
+            exit 1
+          fi
 
       - name: Get and display tunnel URLs
         run: |
-          TUNNELS=$(curl -s http://localhost:4040/api/tunnels)
+          curl -s http://localhost:4040/api/tunnels > /tmp/tunnels.json
 
-          NOVNC_URL=$(echo $TUNNELS | python3 -c "
-          import sys, json
-          t = json.load(sys.stdin)['tunnels']
+          NOVNC_URL=$(python3 -c "
+          import json
+          t = json.load(open('/tmp/tunnels.json'))['tunnels']
           for tunnel in t:
-              if '${{ env.NOVNC_PORT }}' in tunnel.get('config', {}).get('addr', ''):
+              if tunnel.get('name') == 'novnc':
                   print(tunnel['public_url'])
                   break
-          " 2>/dev/null || echo "")
+          ")
 
-          API_URL=$(echo $TUNNELS | python3 -c "
-          import sys, json
-          t = json.load(sys.stdin)['tunnels']
+          API_URL=$(python3 -c "
+          import json
+          t = json.load(open('/tmp/tunnels.json'))['tunnels']
           for tunnel in t:
-              if '${{ env.BACKEND_PORT }}' in tunnel.get('config', {}).get('addr', ''):
+              if tunnel.get('name') == 'backend':
                   print(tunnel['public_url'])
                   break
-          " 2>/dev/null || echo "")
+          ")
 
-          echo ""
+          if [ -z "$NOVNC_URL" ] || [ -z "$API_URL" ]; then
+            echo "::error::Could not resolve one or both tunnel URLs - raw ngrok response below:"
+            cat /tmp/tunnels.json
+            exit 1
+          fi
+
+          {
+            echo "## Android Emulator Session Ready"
+            echo ""
+            echo "| Service | URL |"
+            echo "|---|---|"
+            echo "| Web UI (noVNC) | $NOVNC_URL/vnc.html |"
+            echo "| Backend API | $API_URL |"
+            echo ""
+            echo "_Note: ngrok's free plan shows a one-time browser warning page._"
+            echo "_Click **Visit Site** to continue the first time you open the noVNC link._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
           echo "========================================"
           echo "   ANDROID EMULATOR SESSION READY!"
           echo "========================================"
